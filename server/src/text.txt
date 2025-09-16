@@ -1,0 +1,335 @@
+// =============================================
+// Qatalyst Backend — Auth Module (NestJS + Supabase + Drizzle)
+// Files included in this single snippet:
+//  - package.json (deps)
+//  - .env.example
+//  - src/database/schema.ts (users table — Drizzle)
+//  - src/database/drizzle.service.ts (DB provider)
+//  - src/auth/auth.module.ts
+//  - src/auth/auth.service.ts
+//  - src/auth/auth.controller.ts
+//  - src/auth/supabase.strategy.ts (JWT verification via Supabase JWKS)
+//  - src/auth/jwt-auth.guard.ts
+//  - src/common/decorators/user.decorator.ts
+//  - src/common/decorators/roles.decorator.ts
+//  - src/common/guards/roles.guard.ts
+//  - src/common/types/auth.ts
+//  - src/app.module.ts
+//  - src/main.ts
+// =============================================
+
+// ---------- package.json (add these) ----------
+{
+  "name": "qatalyst-backend",
+  "version": "0.0.1",
+  "dependencies": {
+    "@nestjs/common": "^10.0.0",
+    "@nestjs/core": "^10.0.0",
+    "@nestjs/platform-express": "^10.0.0",
+    "@nestjs/config": "^3.2.0",
+    "@supabase/supabase-js": "^2.45.0",
+    "drizzle-orm": "^0.33.0",
+    "pg": "^8.11.5",
+    "jsonwebtoken": "^9.0.2",
+    "jose": "^5.8.0",
+    "bcrypt": "^5.1.1",
+    "class-transformer": "^0.5.1",
+    "class-validator": "^0.14.0"
+  },
+  "devDependencies": {
+    "drizzle-kit": "^0.24.0",
+    "typescript": "^5.4.0",
+    "@types/jsonwebtoken": "^9.0.6",
+    "@types/bcrypt": "^5.0.0"
+  }
+}
+
+// ---------- .env.example ----------
+// App
+PORT=4000
+NODE_ENV=development
+
+// Database (PostgreSQL)
+DB_HOST=localhost
+DB_PORT=5432
+DB_USER=postgres
+DB_PASSWORD=postgres
+DB_NAME=qatalyst
+
+// Supabase
+SUPABASE_URL=https://your-project-ref.supabase.co
+SUPABASE_ANON_KEY=your-public-anon-key
+SUPABASE_SERVICE_ROLE_KEY=your-service-role-key
+// JWKS endpoint used to verify Supabase JWTs
+SUPABASE_JWKS_URL=https://your-project-ref.supabase.co/auth/v1/certs
+
+// ---------- src/database/schema.ts ----------
+import { pgTable, serial, text, varchar, timestamp, pgEnum, uuid } from "drizzle-orm/pg-core";
+
+export const userRole = pgEnum("user_role", ["admin", "staff", "customer"]);
+
+export const users = pgTable("users", {
+  id: serial("id").primaryKey(),
+  supabaseId: uuid("supabase_id").notNull(), // maps to auth.users.id
+  name: varchar("name", { length: 120 }).notNull(),
+  email: varchar("email", { length: 160 }).notNull().unique(),
+  phone: varchar("phone", { length: 40 }),
+  role: userRole("role").notNull().default("customer"),
+  createdAt: timestamp("created_at").notNull().defaultNow(),
+  updatedAt: timestamp("updated_at").notNull().defaultNow(),
+});
+
+// ---------- src/database/drizzle.service.ts ----------
+import { Injectable, OnModuleDestroy } from "@nestjs/common";
+import { drizzle } from "drizzle-orm/node-postgres";
+import { Pool } from "pg";
+import * as schema from "./schema";
+
+@Injectable()
+export class DrizzleService implements OnModuleDestroy {
+  public db;
+  private pool: Pool;
+
+  constructor() {
+    this.pool = new Pool({
+      host: process.env.DB_HOST,
+      port: Number(process.env.DB_PORT || 5432),
+      user: process.env.DB_USER,
+      password: process.env.DB_PASSWORD,
+      database: process.env.DB_NAME,
+    });
+    this.db = drizzle(this.pool, { schema });
+  }
+
+  async onModuleDestroy() {
+    await this.pool.end();
+  }
+}
+
+// ---------- src/common/types/auth.ts ----------
+export type SupabaseJwtPayload = {
+  sub: string; // Supabase auth user id (UUID)
+  email?: string;
+  role?: string; // "authenticated" for end-users
+  exp: number;
+  iat: number;
+  // custom claims (if any)
+  [key: string]: any;
+};
+
+export type RequestUser = {
+  id: string; // supabase id
+  email?: string;
+  role: "admin" | "staff" | "customer";
+};
+
+// ---------- src/auth/supabase.strategy.ts ----------
+import { Injectable, UnauthorizedException } from "@nestjs/common";
+import { createRemoteJWKSet, jwtVerify, JWTPayload } from "jose";
+import { SupabaseJwtPayload } from "../common/types/auth";
+
+@Injectable()
+export class SupabaseJwtVerifier {
+  private jwks = createRemoteJWKSet(new URL(process.env.SUPABASE_JWKS_URL!));
+
+  /**
+   * Verifies a Supabase JWT (access token) and returns payload.
+   */
+  async verify(token: string): Promise<SupabaseJwtPayload> {
+    try {
+      const { payload } = await jwtVerify(token, this.jwks, {
+        issuer: process.env.SUPABASE_URL,
+        audience: "authenticated",
+      });
+      return payload as SupabaseJwtPayload;
+    } catch (e) {
+      throw new UnauthorizedException("Invalid or expired token");
+    }
+  }
+}
+
+// ---------- src/auth/jwt-auth.guard.ts ----------
+import { CanActivate, ExecutionContext, Injectable, UnauthorizedException } from "@nestjs/common";
+import { SupabaseJwtVerifier } from "./supabase.strategy";
+
+@Injectable()
+export class JwtAuthGuard implements CanActivate {
+  constructor(private verifier: SupabaseJwtVerifier) {}
+
+  async canActivate(ctx: ExecutionContext): Promise<boolean> {
+    const req = ctx.switchToHttp().getRequest();
+    const auth = req.headers["authorization"] as string | undefined;
+    if (!auth || !auth.startsWith("Bearer ")) throw new UnauthorizedException("Missing token");
+
+    const token = auth.substring("Bearer ".length);
+    const payload = await this.verifier.verify(token);
+
+    // Attach to request for downstream use
+    req.user = { id: payload.sub, email: payload.email };
+    return true;
+  }
+}
+
+// ---------- src/common/decorators/user.decorator.ts ----------
+import { createParamDecorator, ExecutionContext } from "@nestjs/common";
+
+export const AuthUser = createParamDecorator((_data: unknown, ctx: ExecutionContext) => {
+  const req = ctx.switchToHttp().getRequest();
+  return req.user as { id: string; email?: string };
+});
+
+// ---------- src/common/decorators/roles.decorator.ts ----------
+import { SetMetadata } from "@nestjs/common";
+export const ROLES_KEY = "roles";
+export const Roles = (...roles: ("admin" | "staff" | "customer")[]) => SetMetadata(ROLES_KEY, roles);
+
+// ---------- src/common/guards/roles.guard.ts ----------
+import { CanActivate, ExecutionContext, Injectable, ForbiddenException, Reflector } from "@nestjs/common";
+import { ROLES_KEY } from "../decorators/roles.decorator";
+import { DrizzleService } from "../../database/drizzle.service";
+import { eq } from "drizzle-orm";
+import { users } from "../../database/schema";
+
+@Injectable()
+export class RolesGuard implements CanActivate {
+  constructor(private reflector: Reflector, private db: DrizzleService) {}
+
+  async canActivate(context: ExecutionContext): Promise<boolean> {
+    const required = this.reflector.get<("admin"|"staff"|"customer")[] | undefined>(ROLES_KEY, context.getHandler());
+    if (!required || required.length === 0) return true;
+
+    const req = context.switchToHttp().getRequest();
+    const supabaseId = req.user?.id as string | undefined;
+    if (!supabaseId) throw new ForbiddenException("No user");
+
+    const [u] = await this.db.db.select().from(users).where(eq(users.supabaseId, supabaseId));
+    if (!u) throw new ForbiddenException("User not provisioned");
+
+    if (!required.includes(u.role as any)) throw new ForbiddenException("Insufficient role");
+    return true;
+  }
+}
+
+// ---------- src/auth/auth.service.ts ----------
+import { Injectable, BadRequestException } from "@nestjs/common";
+import { createClient } from "@supabase/supabase-js";
+import { DrizzleService } from "../database/drizzle.service";
+import { users } from "../database/schema";
+import { eq } from "drizzle-orm";
+
+@Injectable()
+export class AuthService {
+  private admin = createClient(process.env.SUPABASE_URL!, process.env.SUPABASE_SERVICE_ROLE_KEY!);
+
+  constructor(private db: DrizzleService) {}
+
+  /**
+   * Idempotent provisioning: ensure a local profile row exists for a Supabase user.
+   */
+  async ensureUser(supabaseId: string, email?: string, name?: string) {
+    const existing = await this.db.db.select().from(users).where(eq(users.supabaseId, supabaseId));
+    if (existing.length > 0) return existing[0];
+    const [inserted] = await this.db.db.insert(users).values({ supabaseId, email: email ?? "", name: name ?? "User" }).returning();
+    return inserted;
+  }
+
+  /**
+   * Admin-only: create a STAFF or ADMIN account via Supabase Admin API, then provision profile.
+   */
+  async createStaffOrAdmin(payload: { email: string; password: string; name: string; role: "staff" | "admin" }) {
+    // 1) Create user in Supabase Auth (email+password)
+    const { data, error } = await this.admin.auth.admin.createUser({
+      email: payload.email,
+      password: payload.password,
+      email_confirm: true,
+      user_metadata: { name: payload.name },
+    });
+    if (error || !data.user) throw new BadRequestException(error?.message || "Failed to create user");
+
+    // 2) Upsert local profile with role
+    const [inserted] = await this.db.db
+      .insert(users)
+      .values({ supabaseId: data.user.id, email: payload.email, name: payload.name, role: payload.role })
+      .onConflictDoUpdate({
+        target: users.supabaseId,
+        set: { email: payload.email, name: payload.name, role: payload.role },
+      })
+      .returning();
+
+    return { supabaseId: data.user.id, profile: inserted };
+  }
+
+  /** Fetch current user's profile (from local users table). */
+  async me(supabaseId: string) {
+    const [u] = await this.db.db.select().from(users).where(eq(users.supabaseId, supabaseId));
+    return u ?? null;
+  }
+}
+
+// ---------- src/auth/auth.controller.ts ----------
+import { Body, Controller, Get, Post, UseGuards } from "@nestjs/common";
+import { AuthService } from "./auth.service";
+import { JwtAuthGuard } from "./jwt-auth.guard";
+import { AuthUser } from "../common/decorators/user.decorator";
+import { Roles } from "../common/decorators/roles.decorator";
+import { RolesGuard } from "../common/guards/roles.guard";
+
+@Controller("api/auth")
+export class AuthController {
+  constructor(private readonly auth: AuthService) {}
+
+  // Admin endpoint to create STAFF/ADMIN accounts
+  @UseGuards(JwtAuthGuard, RolesGuard)
+  @Roles("admin")
+  @Post("/staff")
+  async createStaff(
+    @Body() body: { email: string; password: string; name: string; role: "staff" | "admin" }
+  ) {
+    return this.auth.createStaffOrAdmin(body);
+  }
+
+  // Ensure local profile exists for current user and fetch it
+  @UseGuards(JwtAuthGuard)
+  @Get("/me")
+  async me(@AuthUser() user: { id: string; email?: string }) {
+    const profile = await this.auth.ensureUser(user.id, user.email);
+    return profile;
+  }
+}
+
+// ---------- src/auth/auth.module.ts ----------
+import { Module } from "@nestjs/common";
+import { AuthController } from "./auth.controller";
+import { AuthService } from "./auth.service";
+import { SupabaseJwtVerifier } from "./supabase.strategy";
+import { DrizzleService } from "../database/drizzle.service";
+
+@Module({
+  controllers: [AuthController],
+  providers: [AuthService, SupabaseJwtVerifier, DrizzleService],
+  exports: [AuthService],
+})
+export class AuthModule {}
+
+// ---------- src/app.module.ts ----------
+import { Module } from "@nestjs/common";
+import { ConfigModule } from "@nestjs/config";
+import { AuthModule } from "./auth/auth.module";
+
+@Module({
+  imports: [ConfigModule.forRoot({ isGlobal: true }), AuthModule],
+})
+export class AppModule {}
+
+// ---------- src/main.ts ----------
+import { ValidationPipe } from "@nestjs/common";
+import { NestFactory } from "@nestjs/core";
+import { AppModule } from "./app.module";
+
+async function bootstrap() {
+  const app = await NestFactory.create(AppModule);
+  app.setGlobalPrefix("/");
+  app.useGlobalPipes(new ValidationPipe({ whitelist: true, transform: true }));
+  await app.listen(process.env.PORT || 4000);
+}
+bootstrap();
